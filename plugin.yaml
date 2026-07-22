@@ -1,0 +1,18 @@
+name: xerg_hermes_observer
+version: "0.9.0"
+description: "Optional local, content-free mechanical telemetry for Xerg. No network export."
+author: Xerg
+manifest_version: 1
+kind: standalone
+provides_hooks:
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - pre_tool_call
+  - post_tool_call
+  - transform_terminal_output
+  - subagent_start
+  - subagent_stop
+  - on_session_start
+  - on_session_end
+  - on_session_finalize
