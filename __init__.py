@@ -64,6 +64,67 @@ def _json_bytes(value: Any) -> bytes:
     return encoded.encode("utf-8", errors="replace")
 
 
+def _content_chars(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    return len(_json_bytes(value).decode("utf-8", errors="replace"))
+
+
+def _content_bytes(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode("utf-8", errors="replace"))
+    return len(_json_bytes(value))
+
+
+def _first_present(kwargs: dict[str, Any], names: tuple[str, ...]) -> Any:
+    for name in names:
+        if name in kwargs and kwargs[name] is not None:
+            return kwargs[name]
+    return None
+
+
+def _prompt_sizes(kwargs: dict[str, Any]) -> dict[str, int]:
+    messages = _first_present(
+        kwargs, ("messages", "input_messages", "conversation", "conversation_history")
+    )
+    system_prompt = _first_present(
+        kwargs, ("system_prompt", "system", "system_message", "instructions")
+    )
+    tool_definitions = _first_present(
+        kwargs, ("tools", "tool_definitions", "tool_schemas", "available_tools")
+    )
+    result: dict[str, int] = {}
+    total_chars = 0
+    total_bytes = 0
+    if messages is not None:
+        result["input_messages_count"] = len(messages) if isinstance(messages, list) else 1
+        result["input_messages_chars"] = _content_chars(messages)
+        result["input_messages_bytes"] = _content_bytes(messages)
+        total_chars += result["input_messages_chars"]
+        total_bytes += result["input_messages_bytes"]
+    if system_prompt is not None:
+        result["system_prompt_chars"] = _content_chars(system_prompt)
+        result["system_prompt_bytes"] = _content_bytes(system_prompt)
+        total_chars += result["system_prompt_chars"]
+        total_bytes += result["system_prompt_bytes"]
+    if tool_definitions is not None:
+        result["tool_definitions_count"] = (
+            len(tool_definitions) if isinstance(tool_definitions, (list, dict)) else 1
+        )
+        result["tool_definitions_chars"] = _content_chars(tool_definitions)
+        result["tool_definitions_bytes"] = _content_bytes(tool_definitions)
+        total_chars += result["tool_definitions_chars"]
+        total_bytes += result["tool_definitions_bytes"]
+    if result:
+        result["prompt_total_chars"] = total_chars
+        result["prompt_total_bytes"] = total_bytes
+    return result
+
+
 def _fingerprint(value: Any) -> str:
     return hmac.new(_KEY, _json_bytes(value), hashlib.sha256).hexdigest()
 
@@ -289,18 +350,28 @@ def on_session_finalize(**kwargs: Any) -> None:
 
 
 def on_pre_api_request(**kwargs: Any) -> None:
-    _emit("lifecycle", "api-request-start", **kwargs)
+    event = _base_event("lifecycle", "api-request-start", **kwargs)
+    event.update(_prompt_sizes(kwargs))
+    _writer().emit(event)
 
 
 def _usage_values(value: Any) -> dict[str, int | float]:
     if not isinstance(value, dict):
         return {}
     aliases = {
-        "input_tokens": ("input_tokens", "prompt_tokens"),
-        "output_tokens": ("output_tokens", "completion_tokens"),
-        "cache_read_tokens": ("cache_read_tokens",),
-        "cache_write_tokens": ("cache_write_tokens",),
-        "reasoning_tokens": ("reasoning_tokens",),
+        "input_tokens": ("input_tokens", "prompt_tokens", "input"),
+        "output_tokens": ("output_tokens", "completion_tokens", "output"),
+        "cache_read_tokens": (
+            "cache_read_tokens",
+            "cache_read_input_tokens",
+            "prompt_cache_hit_tokens",
+        ),
+        "cache_write_tokens": (
+            "cache_write_tokens",
+            "cache_creation_input_tokens",
+            "prompt_cache_write_tokens",
+        ),
+        "reasoning_tokens": ("reasoning_tokens", "reasoning_output_tokens"),
     }
     result: dict[str, int | float] = {}
     for output, candidates in aliases.items():
@@ -312,6 +383,23 @@ def _usage_values(value: Any) -> dict[str, int | float]:
     return result
 
 
+def _request_usage(kwargs: dict[str, Any]) -> dict[str, int | float]:
+    candidates = [
+        kwargs.get("usage"),
+        kwargs.get("token_usage"),
+        kwargs.get("response_usage"),
+        kwargs,
+    ]
+    response = kwargs.get("response")
+    if isinstance(response, dict):
+        candidates.extend((response.get("usage"), response.get("usage_metadata")))
+    for candidate in candidates:
+        result = _usage_values(candidate)
+        if result:
+            return result
+    return {}
+
+
 def on_post_api_request(**kwargs: Any) -> None:
     event = _base_event("lifecycle", "api-request-end", **kwargs)
     duration = _number(kwargs.get("duration_ms"))
@@ -320,7 +408,7 @@ def on_post_api_request(**kwargs: Any) -> None:
         duration = api_duration * 1000 if api_duration is not None else None
     if duration is not None:
         event["duration_ms"] = duration
-    event.update(_usage_values(kwargs.get("usage")))
+    event.update(_request_usage(kwargs))
     _writer().emit(event)
 
 
@@ -332,6 +420,7 @@ def on_api_request_error(**kwargs: Any) -> None:
         duration = api_duration * 1000 if api_duration is not None else None
     if duration is not None:
         event["duration_ms"] = duration
+    event.update(_request_usage(kwargs))
     _writer().emit(event)
 
 

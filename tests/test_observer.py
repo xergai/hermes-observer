@@ -53,6 +53,34 @@ class ObserverPrivacyTest(unittest.TestCase):
             secret_path = "/private/customer/secret.txt"
             secret_command = "cat /private/customer/secret.txt"
             secret_result = "customer-secret-result"
+            plugin.on_pre_api_request(
+                session_id="session-1",
+                turn_id="turn-1",
+                api_request_id="request-1",
+                provider="anthropic",
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": secret_result}],
+                system_prompt=secret_command,
+                tools=[{"name": "read_file", "description": secret_path}],
+            )
+            plugin.on_post_api_request(
+                session_id="session-1",
+                turn_id="turn-1",
+                api_request_id="request-1",
+                provider="anthropic",
+                model="claude-sonnet-4-6",
+                usage={"input_tokens": 10, "output_tokens": 2},
+                duration_ms=5,
+            )
+            plugin.on_api_request_error(
+                session_id="session-1",
+                turn_id="turn-1",
+                api_request_id="request-error",
+                provider="anthropic",
+                model="claude-sonnet-4-6",
+                prompt_tokens=3,
+                completion_tokens=0,
+            )
             plugin.on_pre_tool_call(
                 telemetry_schema_version="hermes.observer.v1",
                 session_id="session-1",
@@ -116,8 +144,25 @@ class ObserverPrivacyTest(unittest.TestCase):
             self.assertNotIn(secret_command, contents)
             self.assertNotIn(secret_result, contents)
             events = [json.loads(line) for line in contents.splitlines()]
-            self.assertTrue(events[0]["input_fingerprint"])
-            self.assertTrue(events[0]["target_fingerprint"])
+            request_start = next(
+                event for event in events if event["phase"] == "api-request-start"
+            )
+            self.assertEqual(request_start["input_messages_count"], 1)
+            self.assertGreater(request_start["prompt_total_chars"], 0)
+            self.assertGreater(request_start["prompt_total_bytes"], 0)
+            self.assertGreater(request_start["system_prompt_bytes"], 0)
+            self.assertGreater(request_start["tool_definitions_bytes"], 0)
+            request_error = next(
+                event for event in events if event["phase"] == "api-request-error"
+            )
+            self.assertEqual(request_error["input_tokens"], 3)
+            tool_start = next(
+                event
+                for event in events
+                if event["event_type"] == "tool" and event["phase"] == "pre"
+            )
+            self.assertTrue(tool_start["input_fingerprint"])
+            self.assertTrue(tool_start["target_fingerprint"])
             terminal_event = next(
                 event for event in events if event["event_type"] == "terminal-output"
             )
