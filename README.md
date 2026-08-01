@@ -17,3 +17,15 @@ and file contents. It persists only timestamps, opaque correlation IDs, names, d
 statuses, token buckets, byte counts, and process-scoped keyed fingerprints. Files use mode
 `0600`, a bounded queue reports drops, interrupted trailing records are safe to ignore, and the
 default retention is seven days.
+
+After installation, restart the Hermes gateway and start a new session. Then verify the observer
+before relying on request-sequence findings:
+
+```sh
+xerg doctor --runtime hermes
+```
+
+Doctor reports whether the plugin is absent, installed but not loaded, fresh, stale,
+retention-pruned, partial, conflicting, or fully reconciled. The observer emits its version,
+startup time, retention, writer health, freshness, and dropped-event count. It must be running
+before activity occurs; historical `state.db` aggregates cannot be reconstructed.

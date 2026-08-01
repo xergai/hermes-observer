@@ -144,6 +144,16 @@ class ObserverPrivacyTest(unittest.TestCase):
             self.assertNotIn(secret_command, contents)
             self.assertNotIn(secret_result, contents)
             events = [json.loads(line) for line in contents.splitlines()]
+            observer_status = next(
+                event for event in events if event["event_type"] == "observer-status"
+            )
+            self.assertEqual(observer_status["plugin_version"], "0.17.0")
+            self.assertEqual(
+                observer_status["telemetry_schema_version"],
+                "xerg.hermes.observer.v1",
+            )
+            self.assertEqual(observer_status["retention_days"], 7)
+            self.assertTrue(observer_status["writer_healthy"])
             request_start = next(
                 event for event in events if event["phase"] == "api-request-start"
             )

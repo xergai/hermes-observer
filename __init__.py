@@ -24,6 +24,7 @@ from typing import Any
 
 SCHEMA = "xerg.hermes.observer.v1"
 HERMES_OBSERVER_SCHEMA = "hermes.observer.v1"
+PLUGIN_VERSION = "0.17.0"
 DEFAULT_RETENTION_DAYS = 7
 MAX_QUEUE_SIZE = 2048
 _TRUNCATION_RE = re.compile(
@@ -190,6 +191,7 @@ class _Writer:
             self.directory.chmod(0o700)
         except OSError:
             pass
+        self.retention_days = self._retention_days()
         self._prune()
         stamp = int(time.time())
         self.path = self.directory / f"observer-{os.getpid()}-{stamp}.jsonl"
@@ -204,15 +206,33 @@ class _Writer:
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, name="xerg-observer-writer", daemon=True)
         self.thread.start()
+        status = _base_event("observer-status", "startup")
+        status.update(
+            {
+                "plugin_version": PLUGIN_VERSION,
+                "telemetry_schema_version": SCHEMA,
+                "retention_days": self.retention_days,
+                "writer_healthy": True,
+                "started_at": status["timestamp"],
+            }
+        )
+        self.emit(status)
 
-    def _prune(self) -> None:
+    def _retention_days(self) -> int:
         try:
-            retention = int(
-                os.environ.get("XERG_HERMES_RETENTION_DAYS", DEFAULT_RETENTION_DAYS)
+            return max(
+                1,
+                int(
+                    os.environ.get(
+                        "XERG_HERMES_RETENTION_DAYS", DEFAULT_RETENTION_DAYS
+                    )
+                ),
             )
         except (TypeError, ValueError):
-            retention = DEFAULT_RETENTION_DAYS
-        cutoff = time.time() - max(1, retention) * 86400
+            return DEFAULT_RETENTION_DAYS
+
+    def _prune(self) -> None:
+        cutoff = time.time() - self.retention_days * 86400
         for path in self.directory.glob("observer-*.jsonl"):
             try:
                 if path.stat().st_mtime < cutoff:
