@@ -147,7 +147,7 @@ class ObserverPrivacyTest(unittest.TestCase):
             observer_status = next(
                 event for event in events if event["event_type"] == "observer-status"
             )
-            self.assertEqual(observer_status["plugin_version"], "0.17.0")
+            self.assertEqual(observer_status["plugin_version"], "0.24.1")
             self.assertEqual(
                 observer_status["telemetry_schema_version"],
                 "xerg.hermes.observer.v1",
@@ -181,6 +181,7 @@ class ObserverPrivacyTest(unittest.TestCase):
                 terminal_event["returned_bytes"], len(returned_output.encode("utf-8"))
             )
             self.assertEqual(terminal_event["truncated_bytes"], 42)
+            self.assertEqual(terminal_event["terminal_measurement_basis"], "exact")
             delegation_events = [
                 event for event in events if event["event_type"] == "delegation"
             ]
@@ -190,6 +191,162 @@ class ObserverPrivacyTest(unittest.TestCase):
             )
             self.assertIn("queue_wait_ms", delegation_events[1])
             self.assertEqual(ledger.stat().st_mode & 0o777, 0o600)
+
+    def test_v020_structured_character_total_is_a_byte_floor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            plugin = load_plugin(home)
+            visible = (
+                "head😀\n\n... [OUTPUT TRUNCATED - 10,000 chars omitted "
+                "out of 12,345 total] ...\n\ntail"
+            )
+            spill_path = "/private/customer/never-dereference-this.log"
+            plugin.transform_terminal_output(
+                command="private-command",
+                output=visible,
+                task_id="task-v020",
+            )
+            plugin.on_post_tool_call(
+                session_id="session-v020",
+                task_id="task-v020",
+                tool_call_id="tool-v020",
+                tool_name="terminal",
+                args={"command": "private-command"},
+                result={
+                    "output": visible,
+                    "exit_code": 0,
+                    "output_total_chars": 12345,
+                    "full_output_path": spill_path,
+                },
+                status="ok",
+            )
+            plugin.on_post_tool_call(
+                session_id="session-clamp",
+                task_id="task-clamp",
+                tool_call_id="tool-clamp",
+                tool_name="terminal",
+                result={
+                    "output": "😀😀",
+                    "exit_code": 0,
+                    "output_total_chars": 1,
+                    "full_output_path": "/private/also-never-dereference.log",
+                },
+                status="ok",
+            )
+            plugin._shutdown()
+
+            ledger = next((home / "xerg" / "events").glob("*.jsonl"))
+            contents = ledger.read_text()
+            self.assertNotIn(spill_path, contents)
+            events = [json.loads(line) for line in contents.splitlines()]
+            terminal_event = next(
+                event for event in events if event["event_type"] == "terminal-output"
+            )
+            self.assertEqual(
+                terminal_event["terminal_measurement_basis"], "lower-bound"
+            )
+            self.assertTrue(terminal_event["spill_recoverable"])
+            self.assertEqual(terminal_event["generated_bytes_lower_bound"], 12345)
+            self.assertEqual(
+                terminal_event["truncated_bytes_lower_bound"],
+                12345 - len(visible),
+            )
+            self.assertNotIn("generated_bytes", terminal_event)
+            self.assertNotIn("truncated_bytes", terminal_event)
+            clamped_event = next(
+                event
+                for event in events
+                if event.get("tool_call_id") == "tool-clamp"
+                and event["event_type"] == "terminal-output"
+            )
+            self.assertEqual(clamped_event["generated_bytes_lower_bound"], 1)
+            self.assertEqual(clamped_event["truncated_bytes_lower_bound"], 0)
+
+    def test_comma_marker_is_a_fallback_and_missing_totals_stay_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            plugin = load_plugin(home)
+            marker_output = (
+                "head\n\n... [OUTPUT TRUNCATED - 9,999 chars omitted "
+                "out of 10,100 total] ...\n\ntail"
+            )
+            plugin.on_post_tool_call(
+                session_id="session-fallback",
+                task_id="task-fallback",
+                tool_call_id="tool-fallback",
+                tool_name="terminal",
+                result={"output": marker_output, "exit_code": 0},
+                status="ok",
+            )
+            plugin.on_post_tool_call(
+                session_id="session-unavailable",
+                task_id="task-unavailable",
+                tool_call_id="tool-unavailable",
+                tool_name="terminal",
+                result={
+                    "output": "[OUTPUT TRUNCATED - nope chars omitted out of 100 total]",
+                    "exit_code": 0,
+                },
+                status="ok",
+            )
+            plugin._shutdown()
+
+            ledger = next((home / "xerg" / "events").glob("*.jsonl"))
+            terminal_events = [
+                event
+                for event in (json.loads(line) for line in ledger.read_text().splitlines())
+                if event["event_type"] == "terminal-output"
+            ]
+            fallback, unavailable = terminal_events
+            self.assertEqual(fallback["terminal_measurement_basis"], "lower-bound")
+            self.assertEqual(fallback["generated_bytes_lower_bound"], 10100)
+            self.assertGreaterEqual(fallback["truncated_bytes_lower_bound"], 9999)
+            self.assertNotIn("terminal_measurement_basis", unavailable)
+            self.assertNotIn("generated_bytes", unavailable)
+            self.assertNotIn("generated_bytes_lower_bound", unavailable)
+            self.assertIn("returned_bytes", unavailable)
+
+    def test_marker_floor_is_recomputed_after_the_final_visible_output_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            plugin = load_plugin(home)
+            transformed_output = (
+                "head\n\n... [OUTPUT TRUNCATED - 900 chars omitted "
+                "out of 1,000 total] ...\n\ntail"
+            )
+            final_output = "😀tail"
+            plugin.transform_terminal_output(
+                command="bounded-command",
+                output=transformed_output,
+                task_id="task-final-cap",
+            )
+            plugin.on_post_tool_call(
+                session_id="session-final-cap",
+                task_id="task-final-cap",
+                tool_call_id="tool-final-cap",
+                tool_name="terminal",
+                args={"command": "bounded-command"},
+                result={"output": final_output, "exit_code": 0},
+                status="ok",
+            )
+            plugin._shutdown()
+
+            ledger = next((home / "xerg" / "events").glob("*.jsonl"))
+            terminal_event = next(
+                event
+                for event in (
+                    json.loads(line) for line in ledger.read_text().splitlines()
+                )
+                if event["event_type"] == "terminal-output"
+            )
+            self.assertEqual(
+                terminal_event["terminal_measurement_basis"], "lower-bound"
+            )
+            self.assertEqual(terminal_event["generated_bytes_lower_bound"], 1000)
+            self.assertEqual(
+                terminal_event["truncated_bytes_lower_bound"],
+                1000 - len(final_output),
+            )
 
 
 if __name__ == "__main__":

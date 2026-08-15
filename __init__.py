@@ -1,4 +1,4 @@
-"""Content-free, local-only observer for Hermes v0.17+.
+"""Content-free, local-only observer for Hermes v0.17-v0.20.1.
 
 Hook payloads can contain commands, paths, arguments, results, prompts, and
 assistant content. This module may inspect those values transiently to compute
@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import hashlib
 import hmac
+import importlib.metadata
 import json
 import os
 import queue
@@ -24,16 +25,17 @@ from typing import Any
 
 SCHEMA = "xerg.hermes.observer.v1"
 HERMES_OBSERVER_SCHEMA = "hermes.observer.v1"
-PLUGIN_VERSION = "0.17.0"
+PLUGIN_VERSION = "0.24.1"
 DEFAULT_RETENTION_DAYS = 7
 MAX_QUEUE_SIZE = 2048
 _TRUNCATION_RE = re.compile(
-    r"\[OUTPUT TRUNCATED - (?P<omitted>\d+) chars omitted out of (?P<total>\d+) total\]"
+    r"\[OUTPUT TRUNCATED - (?P<omitted>[0-9][0-9,]*) chars omitted "
+    r"out of (?P<total>[0-9][0-9,]*) total\]"
 )
 _WRITE_TOOLS = {"write_file", "patch", "edit_file"}
 _KEY = secrets.token_bytes(32)
 _FINGERPRINT_SCOPE = uuid.uuid4().hex
-_TERMINAL_OUTPUTS: dict[str, list[int]] = {}
+_TERMINAL_OUTPUTS: dict[str, list[tuple[int, int, str]]] = {}
 _TERMINAL_OUTPUTS_LOCK = threading.Lock()
 _PENDING_DELEGATIONS: dict[str, tuple[str, float]] = {}
 _PENDING_DELEGATIONS_LOCK = threading.Lock()
@@ -49,6 +51,14 @@ def _text(value: Any) -> str:
 
 def _number(value: Any) -> int | float | None:
     return value if isinstance(value, (int, float)) and value >= 0 else None
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0 or int(value) != value:
+        return None
+    return int(value)
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -153,14 +163,19 @@ def _terminal_context_key(kwargs: dict[str, Any]) -> str:
     return f"{_task_key(kwargs)}:{command_key}"
 
 
-def _terminal_output_bytes(result: Any) -> int:
-    """Inspect the tool result transiently and return only model-facing output size."""
+def _parsed_terminal_result(result: Any) -> Any:
     parsed = result
     if isinstance(result, str):
         try:
             parsed = json.loads(result)
         except (TypeError, ValueError):
-            return len(result.encode("utf-8", errors="replace"))
+            return result
+    return parsed
+
+
+def _terminal_output_bytes(result: Any) -> int:
+    """Inspect the tool result transiently and return only model-facing output size."""
+    parsed = _parsed_terminal_result(result)
     if isinstance(parsed, dict):
         output = parsed.get("output")
         if isinstance(output, str):
@@ -169,15 +184,29 @@ def _terminal_output_bytes(result: Any) -> int:
 
 
 def _terminal_output_text(result: Any) -> str:
-    parsed = result
-    if isinstance(result, str):
-        try:
-            parsed = json.loads(result)
-        except (TypeError, ValueError):
-            return result
+    parsed = _parsed_terminal_result(result)
     if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
         return parsed["output"]
-    return ""
+    return parsed if isinstance(parsed, str) else ""
+
+
+def _terminal_output_total_chars(result: Any) -> int | None:
+    """Read only structured scalar metadata; never inspect the spill path."""
+    parsed = _parsed_terminal_result(result)
+    if not isinstance(parsed, dict):
+        return None
+    return _nonnegative_int(parsed.get("output_total_chars"))
+
+
+def _marker_count(match: re.Match[str], name: str) -> int:
+    return int(match.group(name).replace(",", ""))
+
+
+def _installed_hermes_version() -> str:
+    try:
+        return importlib.metadata.version("hermes-agent")
+    except importlib.metadata.PackageNotFoundError:
+        return ""
 
 
 class _Writer:
@@ -216,6 +245,9 @@ class _Writer:
                 "started_at": status["timestamp"],
             }
         )
+        hermes_version = _installed_hermes_version()
+        if hermes_version:
+            status["hermes_version"] = hermes_version
         self.emit(status)
 
     def _retention_days(self) -> int:
@@ -471,22 +503,59 @@ def on_post_tool_call(**kwargs: Any) -> None:
         key = _terminal_context_key(kwargs)
         with _TERMINAL_OUTPUTS_LOCK:
             pending = _TERMINAL_OUTPUTS.get(key, [])
-            generated_bytes = pending.pop(0) if pending else None
+            captured = pending.pop(0) if pending else None
             if not pending:
                 _TERMINAL_OUTPUTS.pop(key, None)
         output = _terminal_output_text(kwargs.get("result"))
         returned_bytes = _terminal_output_bytes(kwargs.get("result"))
-        marker = _TRUNCATION_RE.search(output)
-        omitted_bytes = int(marker.group("omitted")) if marker else 0
-        reported_total = int(marker.group("total")) if marker else 0
-        generated_bytes = max(generated_bytes or returned_bytes, reported_total)
+        output_total_chars = _terminal_output_total_chars(kwargs.get("result"))
         terminal_event = _base_event("terminal-output", "terminal-output", **kwargs)
         terminal_event["tool_name"] = "terminal"
-        terminal_event["generated_bytes"] = generated_bytes
         terminal_event["returned_bytes"] = returned_bytes
-        terminal_event["truncated_bytes"] = (
-            max(omitted_bytes, generated_bytes - returned_bytes) if marker else 0
-        )
+        if output_total_chars is not None:
+            # Hermes v0.20+ bounds capture before this observer hook. Its
+            # character total is therefore a conservative UTF-8 byte floor.
+            # Python len(str) counts Unicode codepoints, not UTF-16 units.
+            generated_floor = output_total_chars
+            truncated_floor = max(0, output_total_chars - len(output))
+            terminal_event["terminal_measurement_basis"] = "lower-bound"
+            terminal_event["spill_recoverable"] = True
+            terminal_event["generated_bytes_lower_bound"] = generated_floor
+            terminal_event["truncated_bytes_lower_bound"] = truncated_floor
+        elif captured is not None:
+            generated_bytes, truncated_bytes, basis = captured
+            marker = _TRUNCATION_RE.search(output)
+            if marker and basis == "exact":
+                omitted_chars = _marker_count(marker, "omitted")
+                truncated_bytes = max(
+                    omitted_chars, generated_bytes - returned_bytes
+                )
+            elif basis == "lower-bound":
+                # A later Hermes cap can shorten the output after the transform
+                # hook. Recompute the conservative floor from the final
+                # model-facing Unicode codepoint count.
+                truncated_bytes = max(
+                    truncated_bytes, generated_bytes - len(output), 0
+                )
+            terminal_event["terminal_measurement_basis"] = basis
+            if basis == "exact":
+                terminal_event["generated_bytes"] = generated_bytes
+                terminal_event["truncated_bytes"] = truncated_bytes
+            else:
+                terminal_event["generated_bytes_lower_bound"] = generated_bytes
+                terminal_event["truncated_bytes_lower_bound"] = truncated_bytes
+        else:
+            # Marker prose is a compatibility fallback only. Comma-formatted
+            # counts are character totals and remain byte lower bounds.
+            marker = _TRUNCATION_RE.search(output)
+            if marker:
+                total_chars = _marker_count(marker, "total")
+                omitted_chars = _marker_count(marker, "omitted")
+                terminal_event["terminal_measurement_basis"] = "lower-bound"
+                terminal_event["generated_bytes_lower_bound"] = total_chars
+                terminal_event["truncated_bytes_lower_bound"] = max(
+                    omitted_chars, total_chars - len(output), 0
+                )
         _writer().emit(terminal_event)
 
 
@@ -494,16 +563,20 @@ def transform_terminal_output(**kwargs: Any) -> None:
     output = _text(kwargs.get("output"))
     generated_bytes = len(output.encode("utf-8", errors="replace"))
     match = _TRUNCATION_RE.search(output)
+    truncated_bytes = 0
+    basis = "exact"
     if match:
         # Older Hermes versions can expose an earlier capture-truncation marker.
         # Preserve a conservative lower bound before the final tool-result cap.
-        generated_bytes = max(
-            generated_bytes + int(match.group("omitted")), int(match.group("total"))
-        )
+        omitted_chars = _marker_count(match, "omitted")
+        total_chars = _marker_count(match, "total")
+        generated_bytes = total_chars
+        truncated_bytes = max(omitted_chars, total_chars - len(output), 0)
+        basis = "lower-bound"
     key = _terminal_context_key(kwargs)
     with _TERMINAL_OUTPUTS_LOCK:
         pending = _TERMINAL_OUTPUTS.setdefault(key, [])
-        pending.append(generated_bytes)
+        pending.append((generated_bytes, truncated_bytes, basis))
     return None
 
 
