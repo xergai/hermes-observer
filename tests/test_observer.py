@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -45,6 +46,68 @@ class ObserverPrivacyTest(unittest.TestCase):
                     "on_session_finalize",
                 },
             )
+            health_path = next((Path(directory) / "xerg" / "events").glob("observer-health-*.json"))
+            health = json.loads(health_path.read_text())
+            self.assertEqual(health["schema"], "xerg.hermes.observer-health.v1")
+            self.assertEqual(health["state"], "running")
+            self.assertTrue(health["writer_healthy"])
+            self.assertEqual(health_path.stat().st_mode & 0o777, 0o600)
+            plugin._shutdown()
+            stopped = json.loads(health_path.read_text())
+            self.assertEqual(stopped["state"], "stopped")
+            self.assertIn("stopped_at", stopped)
+
+    def test_heartbeat_updates_health_without_growing_the_evidence_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            plugin = load_plugin(home)
+
+            class Context:
+                def register_hook(self, _name, _callback):
+                    pass
+
+            plugin.register(Context())
+            writer = plugin._WRITER
+            self.assertIsNotNone(writer)
+            assert writer is not None
+            deadline = time.time() + 1
+            while writer.path.stat().st_size == 0 and time.time() < deadline:
+                time.sleep(0.01)
+            before = writer.path.read_text().splitlines()
+            old_timestamp = time.time() - 120
+            os.utime(writer.path, (old_timestamp, old_timestamp))
+            writer._heartbeat_once()
+            writer._heartbeat_once()
+            after = writer.path.read_text().splitlines()
+            self.assertEqual(after, before)
+            self.assertGreater(writer.path.stat().st_mtime, old_timestamp)
+            health = json.loads(writer.health_path.read_text())
+            self.assertEqual(health["state"], "running")
+            self.assertEqual(health["started_at"], json.loads(before[0])["started_at"])
+            plugin._shutdown()
+
+    def test_prunes_health_files_independently_from_ledgers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            events = home / "xerg" / "events"
+            events.mkdir(parents=True)
+            old_health = events / "observer-health-999.json"
+            old_ledger = events / "observer-999-1.jsonl"
+            old_health.write_text("{}")
+            old_ledger.write_text("{}\n")
+            old_timestamp = time.time() - 8 * 86400
+            os.utime(old_health, (old_timestamp, old_timestamp))
+            os.utime(old_ledger, (old_timestamp, old_timestamp))
+            plugin = load_plugin(home)
+
+            class Context:
+                def register_hook(self, _name, _callback):
+                    pass
+
+            plugin.register(Context())
+            self.assertFalse(old_health.exists())
+            self.assertFalse(old_ledger.exists())
+            plugin._shutdown()
 
     def test_discards_sensitive_values_and_reports_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -147,7 +210,7 @@ class ObserverPrivacyTest(unittest.TestCase):
             observer_status = next(
                 event for event in events if event["event_type"] == "observer-status"
             )
-            self.assertEqual(observer_status["plugin_version"], "0.24.1")
+            self.assertEqual(observer_status["plugin_version"], "0.24.2")
             self.assertEqual(
                 observer_status["telemetry_schema_version"],
                 "xerg.hermes.observer.v1",

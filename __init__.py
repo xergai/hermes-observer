@@ -24,9 +24,11 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "xerg.hermes.observer.v1"
+HEALTH_SCHEMA = "xerg.hermes.observer-health.v1"
 HERMES_OBSERVER_SCHEMA = "hermes.observer.v1"
-PLUGIN_VERSION = "0.24.1"
+PLUGIN_VERSION = "0.24.2"
 DEFAULT_RETENTION_DAYS = 7
+HEARTBEAT_INTERVAL_SECONDS = 60
 MAX_QUEUE_SIZE = 2048
 _TRUNCATION_RE = re.compile(
     r"\[OUTPUT TRUNCATED - (?P<omitted>[0-9][0-9,]*) chars omitted "
@@ -221,9 +223,11 @@ class _Writer:
         except OSError:
             pass
         self.retention_days = self._retention_days()
-        self._prune()
+        self._prune_ledgers()
+        self._prune_health_files()
         stamp = int(time.time())
         self.path = self.directory / f"observer-{os.getpid()}-{stamp}.jsonl"
+        self.health_path = self.directory / f"observer-health-{os.getpid()}.json"
         descriptor = os.open(self.path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         try:
             os.fchmod(descriptor, 0o600)
@@ -233,8 +237,21 @@ class _Writer:
         self.queue: queue.Queue[dict[str, Any] | None] = queue.Queue(MAX_QUEUE_SIZE)
         self.dropped = 0
         self.lock = threading.Lock()
+        self.health_lock = threading.Lock()
+        self.stop_heartbeat = threading.Event()
+        self.started_at = _now()
+        self.hermes_version = _installed_hermes_version()
+        self.writer_healthy = True
+        self.closed = False
         self.thread = threading.Thread(target=self._run, name="xerg-observer-writer", daemon=True)
         self.thread.start()
+        self._write_health("running")
+        self.heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="xerg-observer-heartbeat",
+            daemon=True,
+        )
+        self.heartbeat_thread.start()
         status = _base_event("observer-status", "startup")
         status.update(
             {
@@ -242,12 +259,11 @@ class _Writer:
                 "telemetry_schema_version": SCHEMA,
                 "retention_days": self.retention_days,
                 "writer_healthy": True,
-                "started_at": status["timestamp"],
+                "started_at": self.started_at,
             }
         )
-        hermes_version = _installed_hermes_version()
-        if hermes_version:
-            status["hermes_version"] = hermes_version
+        if self.hermes_version:
+            status["hermes_version"] = self.hermes_version
         self.emit(status)
 
     def _retention_days(self) -> int:
@@ -263,7 +279,7 @@ class _Writer:
         except (TypeError, ValueError):
             return DEFAULT_RETENTION_DAYS
 
-    def _prune(self) -> None:
+    def _prune_ledgers(self) -> None:
         cutoff = time.time() - self.retention_days * 86400
         for path in self.directory.glob("observer-*.jsonl"):
             try:
@@ -271,6 +287,73 @@ class _Writer:
                     path.unlink()
             except OSError:
                 continue
+
+    def _prune_health_files(self) -> None:
+        cutoff = time.time() - self.retention_days * 86400
+        for path in self.directory.glob("observer-health-*.json"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+
+    def _health_payload(self, state: str, stopped_at: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema": HEALTH_SCHEMA,
+            "state": state,
+            "plugin_version": PLUGIN_VERSION,
+            "writer_healthy": self.writer_healthy,
+            "started_at": self.started_at,
+            "updated_at": _now(),
+        }
+        if self.hermes_version:
+            payload["hermes_version"] = self.hermes_version
+        if stopped_at:
+            payload["stopped_at"] = stopped_at
+        return payload
+
+    def _write_health(self, state: str, stopped_at: str | None = None) -> None:
+        payload = self._health_payload(state, stopped_at)
+        temporary = self.directory / f".{self.health_path.name}.{uuid.uuid4().hex}.tmp"
+        with self.health_lock:
+            descriptor = os.open(
+                temporary,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self.health_path)
+                try:
+                    self.health_path.chmod(0o600)
+                except OSError:
+                    pass
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _heartbeat_once(self) -> None:
+        self._write_health("running")
+        try:
+            os.utime(self.path, None)
+        except OSError:
+            pass
+
+    def _heartbeat_loop(self) -> None:
+        while not self.stop_heartbeat.wait(HEARTBEAT_INTERVAL_SECONDS):
+            try:
+                self._heartbeat_once()
+            except OSError:
+                # A sidecar write failure will naturally age into stale
+                # liveness. It does not prove the evidence writer is unhealthy.
+                pass
 
     def emit(self, event: dict[str, Any]) -> None:
         with self.lock:
@@ -289,13 +372,32 @@ class _Writer:
                 self.dropped += 1
 
     def _run(self) -> None:
-        while True:
-            event = self.queue.get()
-            if event is None:
-                break
-            self.file.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+        try:
+            while True:
+                event = self.queue.get()
+                if event is None:
+                    break
+                self.file.write(
+                    json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+        except OSError:
+            self.writer_healthy = False
+            try:
+                self._write_health("running")
+            except OSError:
+                pass
 
     def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.stop_heartbeat.set()
+        self.heartbeat_thread.join(timeout=1.0)
+        stopped_at = _now()
+        try:
+            self._write_health("stopped", stopped_at)
+        except OSError:
+            pass
         with self.lock:
             if self.dropped:
                 status = _base_event("ledger-status", "dropped-events")
@@ -629,3 +731,6 @@ def register(ctx: Any) -> None:
     ctx.register_hook("on_session_start", on_session_start)
     ctx.register_hook("on_session_end", on_session_end)
     ctx.register_hook("on_session_finalize", on_session_finalize)
+    # Registration proves the gateway loaded the plugin. Create the writer and
+    # process health sidecar before the first workload event arrives.
+    _writer()
