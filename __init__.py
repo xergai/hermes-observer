@@ -26,7 +26,7 @@ from typing import Any
 SCHEMA = "xerg.hermes.observer.v1"
 HEALTH_SCHEMA = "xerg.hermes.observer-health.v1"
 HERMES_OBSERVER_SCHEMA = "hermes.observer.v1"
-PLUGIN_VERSION = "0.24.2"
+PLUGIN_VERSION = "0.25.0"
 DEFAULT_RETENTION_DAYS = 7
 HEARTBEAT_INTERVAL_SECONDS = 60
 MAX_QUEUE_SIZE = 2048
