@@ -23,7 +23,7 @@ statuses, token buckets, byte counts, and process-scoped keyed fingerprints. Fil
 `0600`, a bounded queue reports drops, interrupted trailing records are safe to ignore, and the
 default retention is seven days.
 
-The 0.27.2 observer keeps the `xerg.hermes.observer.v1` ledger and adds no heartbeat records to it.
+The 0.27.3 observer keeps the `xerg.hermes.observer.v1` ledger and adds no heartbeat records to it.
 Instead, registration eagerly creates a mode-`0600`, per-process
 `observer-health-<pid>.json` sidecar. The sidecar is atomically replaced every 60 seconds and
 marked stopped on orderly shutdown; a missing heartbeat becomes stale after 150 seconds. Health
@@ -40,7 +40,7 @@ unavailable rather than being guessed. The observer never reads, stats, resolves
 `full_output_path`, even if a tool result contains a malicious path.
 
 Xerg 0.24.0 was not certified for Hermes v0.20.x terminal mechanics and could understate generated
-or truncated byte metrics. Install Xerg and this observer at 0.27.2 for v0.20.x support and live
+or truncated byte metrics. Install Xerg and this observer at 0.27.3 for v0.20.x support and live
 observer preflight. An older
 Xerg accepts the v1 ledger and ignores the new optional lower-bound fields; a new Xerg accepts old
 ledgers but omits generated/truncated findings when the measurement basis cannot be proven.
