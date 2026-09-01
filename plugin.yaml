@@ -1,5 +1,5 @@
 name: xerg_hermes_observer
-version: "0.30.0"
+version: "0.31.0"
 description: "Optional local, content-free mechanical telemetry for Xerg. No network export."
 author: Xerg
 manifest_version: 1
