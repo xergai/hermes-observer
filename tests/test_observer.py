@@ -7,17 +7,128 @@ import unittest
 from pathlib import Path
 
 
-def load_plugin(home: Path):
+def load_plugin(home: Path, version="0.19.0"):
+    # Unit fixtures explicitly model the established legacy hook contract.
+    # Actual-dispatcher acceptance loads the pinned runtime without this stub.
     os.environ["HERMES_HOME"] = str(home)
     path = Path(__file__).parents[1] / "__init__.py"
     spec = importlib.util.spec_from_file_location("xerg_hermes_observer_test", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if version is not None:
+        module._installed_hermes_version = lambda: version
     return module
 
 
 class ObserverPrivacyTest(unittest.TestCase):
+    def test_inline_child_results_retain_native_status_and_boolean_validation_without_content(self):
+        # Synthetic callback inputs exercise the real observer producer. They
+        # are not a claim that every pinned model/programmatic route emits them.
+        for encoded in (False, True):
+            with self.subTest(encoded=encoded), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                plugin = load_plugin(home, "0.20.6")
+
+                class Context:
+                    def __init__(self):
+                        self.hooks = {}
+
+                    def register_hook(self, name, callback):
+                        self.hooks[name] = callback
+
+                context = Context()
+                plugin.register(context)
+                result = {"results": [
+                    {"task_index": 0, "status": "completed", "schema_valid": False,
+                     "summary": "PRIVATE_RESULT", "schema_errors": ["PRIVATE_SCHEMA_ERROR"],
+                     "child_session_id": "PRIVATE_UNPROVEN_CHILD", "full_output_path": "/private/NEVER_READ_SPILL"},
+                    {"task_index": 1, "status": "completed", "schema_valid": True,
+                     "summary": "PRIVATE_VALID_RESULT", "output_schema": {"PRIVATE_SCHEMA": "PRIVATE_VALUE"}},
+                    {"task_index": 2, "status": "failed", "schema_valid": False},
+                    {"task_index": 3, "status": "interrupted"},
+                ]}
+                before = json.dumps(result, sort_keys=True)
+                self.assertIsNone(context.hooks["post_tool_call"](
+                    session_id="parent", tool_call_id="delegate-one", tool_name="delegate_task",
+                    args={"goal": "PRIVATE_GOAL"}, status="ok",
+                    result=json.dumps(result) if encoded else result,
+                ))
+                self.assertEqual(json.dumps(result, sort_keys=True), before)
+                plugin._shutdown()
+                contents = "\n".join(path.read_text() for path in (home / "xerg/events").iterdir())
+                self.assertNotIn("PRIVATE_", contents)
+                self.assertNotIn("NEVER_READ_SPILL", contents)
+                ledger = next((home / "xerg/events").glob("*.jsonl"))
+                rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+                children = [row for row in rows if row.get("phase") == "subagent-result"]
+                self.assertEqual(len(children), 4)
+                self.assertEqual([row.get("status") for row in children], ["completed", "completed", "failed", "interrupted"])
+                self.assertEqual([row.get("schema_valid") for row in children], [False, True, False, None])
+                self.assertEqual([row.get("task_index") for row in children], [0, 1, 2, 3])
+                self.assertTrue(all(row.get("session_id") == "parent" for row in children))
+                self.assertTrue(all(row.get("tool_call_id") == "delegate-one" for row in children))
+                self.assertTrue(all("child_session_id" not in row for row in children))
+                self.assertTrue(all("schema_valid" not in row for row in rows if row.get("phase") == "post"))
+
+    def test_child_validation_never_coerces_unknown_values_or_promotes_tool_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            plugin = load_plugin(home)
+            result = {"results": [
+                {"schema_valid": value, "task_index": value, "status": "PRIVATE_UNKNOWN_STATUS"}
+                for value in ("true", "false", 1, 0, None, [], {})
+            ]}
+            plugin.on_post_tool_call(
+                session_id="parent", tool_name="delegate_task", tool_call_id="unknown-validation",
+                status="success", result=result,
+            )
+            plugin._shutdown()
+            ledger = next((home / "xerg/events").glob("*.jsonl"))
+            contents = ledger.read_text()
+            self.assertNotIn("PRIVATE_", contents)
+            children = [json.loads(line) for line in contents.splitlines() if json.loads(line).get("phase") == "subagent-result"]
+            self.assertEqual(len(children), 7)
+            self.assertTrue(all("schema_valid" not in row for row in children))
+            self.assertTrue(all("status" not in row for row in children))
+            self.assertTrue(all("child_session_id" not in row for row in children))
+
+    def test_malformed_oversized_and_unsupported_child_envelopes_are_fail_neutral(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            plugin = load_plugin(home, "0.21.0")
+
+            class Context:
+                def __init__(self):
+                    self.hooks = {}
+
+                def register_hook(self, name, callback):
+                    self.hooks[name] = callback
+
+            context = Context()
+            plugin.register(context)
+            payloads = [
+                '{"results": PRIVATE_MALFORMED',
+                "x" * (plugin.MAX_MEASUREMENT_CHARS + 1),
+                {"results": [{"status": "completed", "schema_valid": True}] * 11},
+                {"results": "PRIVATE_UNSUPPORTED_RESULTS"},
+                {"full_output_path": "/private/NEVER_READ_SPILL", "preview": "PRIVATE_PREVIEW"},
+                {"results": [None, "PRIVATE_UNSUPPORTED_CHILD"]},
+            ]
+            for index, payload in enumerate(payloads):
+                self.assertIsNone(context.hooks["post_tool_call"](
+                    session_id="parent", tool_name="delegate_task", tool_call_id=f"unsupported-{index}",
+                    result=payload, status="ok",
+                ))
+            plugin._shutdown()
+            contents = "\n".join(path.read_text() for path in (home / "xerg/events").iterdir())
+            self.assertNotIn("PRIVATE_", contents)
+            self.assertNotIn("NEVER_READ_SPILL", contents)
+            ledger = next((home / "xerg/events").glob("*.jsonl"))
+            rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+            self.assertFalse(any(row.get("phase") == "subagent-result" for row in rows))
+            self.assertFalse(any("schema_valid" in row for row in rows))
+
     def test_registers_the_v017_and_v019_hook_set(self):
         with tempfile.TemporaryDirectory() as directory:
             plugin = load_plugin(Path(directory))
@@ -210,7 +321,7 @@ class ObserverPrivacyTest(unittest.TestCase):
             observer_status = next(
                 event for event in events if event["event_type"] == "observer-status"
             )
-            self.assertEqual(observer_status["plugin_version"], "0.32.4")
+            self.assertEqual(observer_status["plugin_version"], "0.33.0")
             self.assertEqual(
                 observer_status["telemetry_schema_version"],
                 "xerg.hermes.observer.v1",

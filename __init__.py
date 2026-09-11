@@ -1,4 +1,4 @@
-"""Content-free, local-only observer for Hermes v0.17-v0.20.1.
+"""Content-free, local-only observer for the Hermes v1 hook contract.
 
 Hook payloads can contain commands, paths, arguments, results, prompts, and
 assistant content. This module may inspect those values transiently to compute
@@ -8,10 +8,12 @@ sizes and keyed fingerprints, but it never writes the values themselves.
 from __future__ import annotations
 
 import atexit
+import contextvars
 import hashlib
 import hmac
 import importlib.metadata
 import json
+import math
 import os
 import queue
 import re
@@ -26,21 +28,64 @@ from typing import Any
 SCHEMA = "xerg.hermes.observer.v1"
 HEALTH_SCHEMA = "xerg.hermes.observer-health.v1"
 HERMES_OBSERVER_SCHEMA = "hermes.observer.v1"
-PLUGIN_VERSION = "0.32.4"
+PLUGIN_VERSION = "0.33.0"
 DEFAULT_RETENTION_DAYS = 7
 HEARTBEAT_INTERVAL_SECONDS = 60
 MAX_QUEUE_SIZE = 2048
+MAX_MEASUREMENT_CHARS = 1024 * 1024
+MAX_MEASUREMENT_NODES = 8192
+MAX_MEASUREMENT_DEPTH = 32
 _TRUNCATION_RE = re.compile(
     r"\[OUTPUT TRUNCATED - (?P<omitted>[0-9][0-9,]*) chars omitted "
     r"out of (?P<total>[0-9][0-9,]*) total\]"
 )
 _WRITE_TOOLS = {"write_file", "patch", "edit_file"}
-_KEY = secrets.token_bytes(32)
-_FINGERPRINT_SCOPE = uuid.uuid4().hex
-_TERMINAL_OUTPUTS: dict[str, list[tuple[int, int, str]]] = {}
-_TERMINAL_OUTPUTS_LOCK = threading.Lock()
-_PENDING_DELEGATIONS: dict[str, tuple[str, float]] = {}
-_PENDING_DELEGATIONS_LOCK = threading.Lock()
+class _MeasurementUnavailable(ValueError):
+    pass
+
+
+def _hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    return Path(get_hermes_home())
+
+
+class _Scope:
+    def __init__(self, home: Path) -> None:
+        self.home = home
+        self.hermes_version = _installed_hermes_version()
+        self.pre_tool_observation = _pre_tool_observation(self.hermes_version)
+        self.lifecycle_observation = _lifecycle_observation(self.hermes_version)
+        self.tool_argument_comparison = (
+            "eligible" if self.pre_tool_observation == "registered" else "unavailable"
+        )
+        self.profile_scope_id = hashlib.sha256(os.path.realpath(home).encode()).hexdigest()[:32]
+        self.fingerprint_scope = uuid.uuid4().hex
+        self.key = secrets.token_bytes(32)
+        self.terminal_outputs: dict[str, list[tuple[int, int, str]]] = {}
+        self.pending_delegations: dict[str, tuple[str, float] | None] = {}
+        self.terminal_lock = threading.Lock()
+        self.delegation_lock = threading.Lock()
+        self.writer: _Writer | None = None
+        self.closed = False
+
+
+_CURRENT_SCOPE: contextvars.ContextVar[_Scope | None] = contextvars.ContextVar("xerg_observer_scope", default=None)
+_DEFAULT_SCOPE: _Scope | None = None
+_SCOPES: list[_Scope] = []
+
+
+def _scope() -> _Scope:
+    global _DEFAULT_SCOPE
+    selected = _CURRENT_SCOPE.get()
+    if selected is not None:
+        return selected
+    if _DEFAULT_SCOPE is None:
+        _DEFAULT_SCOPE = _Scope(_hermes_home())
+        _SCOPES.append(_DEFAULT_SCOPE)
+    return _DEFAULT_SCOPE
 
 
 def _now() -> str:
@@ -48,36 +93,63 @@ def _now() -> str:
 
 
 def _text(value: Any) -> str:
-    return value if isinstance(value, str) else ""
+    return value if isinstance(value, str) and len(value) <= 512 else ""
 
 
 def _number(value: Any) -> int | float | None:
-    return value if isinstance(value, (int, float)) and value >= 0 else None
+    return value if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0 else None
 
 
 def _nonnegative_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if value < 0 or int(value) != value:
+    if not math.isfinite(value) or value < 0 or int(value) != value:
         return None
     return int(value)
 
 
 def _json_bytes(value: Any) -> bytes:
-    try:
-        encoded = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=lambda _value: "<opaque>",
-        )
-    except Exception:
-        encoded = "<opaque>"
+    _bounded_json(value)
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return encoded.encode("utf-8", errors="replace")
 
 
+def _bounded_json(value: Any) -> None:
+    # A node/character/depth budget bounds work before JSON materialization.
+    # Unsupported values and cycles do not become made-up '<opaque>' evidence.
+    stack = [(value, 0)]
+    nodes, characters = 0, 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_MEASUREMENT_NODES or depth > MAX_MEASUREMENT_DEPTH:
+            raise _MeasurementUnavailable()
+        if isinstance(item, str):
+            characters += len(item)
+        elif item is None or isinstance(item, bool):
+            pass
+        elif isinstance(item, (int, float)):
+            if not math.isfinite(item):
+                raise _MeasurementUnavailable()
+        elif isinstance(item, (dict, list)):
+            if len(item) + nodes + len(stack) > MAX_MEASUREMENT_NODES:
+                raise _MeasurementUnavailable()
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    if not isinstance(key, str):
+                        raise _MeasurementUnavailable()
+                    characters += len(key)
+                    stack.append((child, depth + 1))
+            else:
+                stack.extend((child, depth + 1) for child in item)
+        else:
+            raise _MeasurementUnavailable()
+        if characters > MAX_MEASUREMENT_CHARS:
+            raise _MeasurementUnavailable()
+
+
 def _content_chars(value: Any) -> int:
+    _bounded_json(value)
     if value is None:
         return 0
     if isinstance(value, str):
@@ -86,6 +158,7 @@ def _content_chars(value: Any) -> int:
 
 
 def _content_bytes(value: Any) -> int:
+    _bounded_json(value)
     if value is None:
         return 0
     if isinstance(value, str):
@@ -100,9 +173,9 @@ def _first_present(kwargs: dict[str, Any], names: tuple[str, ...]) -> Any:
     return None
 
 
-def _prompt_sizes(kwargs: dict[str, Any]) -> dict[str, int]:
+def _prompt_sizes(kwargs: dict[str, Any]) -> dict[str, Any]:
     messages = _first_present(
-        kwargs, ("messages", "input_messages", "conversation", "conversation_history")
+        kwargs, ("request_messages", "messages", "input_messages", "conversation", "conversation_history")
     )
     system_prompt = _first_present(
         kwargs, ("system_prompt", "system", "system_message", "instructions")
@@ -110,10 +183,14 @@ def _prompt_sizes(kwargs: dict[str, Any]) -> dict[str, int]:
     tool_definitions = _first_present(
         kwargs, ("tools", "tool_definitions", "tool_schemas", "available_tools")
     )
-    result: dict[str, int] = {}
+    result: dict[str, Any] = {}
     total_chars = 0
     total_bytes = 0
     if messages is not None:
+        try:
+            _bounded_json(messages)
+        except _MeasurementUnavailable:
+            return {"measurement_unavailable": True}
         result["input_messages_count"] = len(messages) if isinstance(messages, list) else 1
         result["input_messages_chars"] = _content_chars(messages)
         result["input_messages_bytes"] = _content_bytes(messages)
@@ -135,11 +212,48 @@ def _prompt_sizes(kwargs: dict[str, Any]) -> dict[str, int]:
     if result:
         result["prompt_total_chars"] = total_chars
         result["prompt_total_bytes"] = total_bytes
+    if "request_messages" in kwargs:
+        measurement = _request_tool_results(kwargs["request_messages"])
+        if measurement is not None:
+            result.update(measurement)
+        else:
+            result["measurement_unavailable"] = True
     return result
 
 
+def _request_tool_results(messages: Any) -> dict[str, Any] | None:
+    if not isinstance(messages, list):
+        return None
+    results = []
+    for message in messages:
+        if not isinstance(message, dict):
+            return None
+        if message.get("type") == "function_call_output":
+            if "output" not in message:
+                return None
+            results.append(message)
+        elif message.get("role") in {"system", "developer", "user", "assistant", "tool"}:
+            if message["role"] == "tool":
+                if "content" not in message:
+                    return None
+                results.append(message)
+            elif isinstance(message.get("content"), list):
+                for block in message["content"]:
+                    if not isinstance(block, dict):
+                        return None
+                    if block.get("type") == "tool_result":
+                        results.append(block)
+        elif message.get("type") not in {"message", "function_call", "reasoning"}:
+            return None
+    return {
+        "model_input_tool_result_count": len(results),
+        "model_input_tool_result_bytes": sum(len(_json_bytes(result)) for result in results),
+        "model_input_tool_result_basis": "hermes-request-hook",
+    }
+
+
 def _fingerprint(value: Any) -> str:
-    return hmac.new(_KEY, _json_bytes(value), hashlib.sha256).hexdigest()
+    return hmac.new(_scope().key, _json_bytes(value), hashlib.sha256).hexdigest()
 
 
 def _target(args: Any) -> Any:
@@ -205,15 +319,45 @@ def _marker_count(match: re.Match[str], name: str) -> int:
 
 
 def _installed_hermes_version() -> str:
+    # Source checkouts need not have installed distribution metadata. Prefer
+    # the executing runtime, never an acceptance/configuration override.
+    try:
+        from hermes_cli import __version__
+        if isinstance(__version__, str) and __version__:
+            return __version__
+    except ImportError:
+        pass
     try:
         return importlib.metadata.version("hermes-agent")
     except importlib.metadata.PackageNotFoundError:
         return ""
 
 
+def _pre_tool_observation(version: str) -> str:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
+    if not match:
+        return "omitted-unknown-runtime"
+    parsed = tuple(int(part) for part in match.groups())
+    if (0, 17, 0) <= parsed <= (0, 20, 1):
+        return "registered"
+    if parsed in {(0, 20, 6), (0, 21, 0)}:
+        # These pinned dispatchers can fail closed before our callback runs.
+        return "omitted-policy-dispatch"
+    return "omitted-unknown-runtime"
+
+
+def _lifecycle_observation(version: str) -> str:
+    if version == "0.20.1":
+        return "complete-capable"
+    if version in {"0.20.6", "0.21.0"}:
+        return "partial"
+    return "unknown"
+
+
 class _Writer:
-    def __init__(self) -> None:
-        home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    def __init__(self, scope: _Scope) -> None:
+        self.scope = scope
+        home = scope.home
         self.directory = Path(
             os.environ.get("XERG_HERMES_EVENTS_DIR", home / "xerg" / "events")
         )
@@ -225,9 +369,9 @@ class _Writer:
         self.retention_days = self._retention_days()
         self._prune_ledgers()
         self._prune_health_files()
-        stamp = int(time.time())
+        stamp = uuid.uuid4().hex
         self.path = self.directory / f"observer-{os.getpid()}-{stamp}.jsonl"
-        self.health_path = self.directory / f"observer-health-{os.getpid()}.json"
+        self.health_path = self.directory / f"observer-health-{os.getpid()}-{stamp}.json"
         descriptor = os.open(self.path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         try:
             os.fchmod(descriptor, 0o600)
@@ -240,7 +384,7 @@ class _Writer:
         self.health_lock = threading.Lock()
         self.stop_heartbeat = threading.Event()
         self.started_at = _now()
-        self.hermes_version = _installed_hermes_version()
+        self.hermes_version = scope.hermes_version
         self.writer_healthy = True
         self.closed = False
         self.thread = threading.Thread(target=self._run, name="xerg-observer-writer", daemon=True)
@@ -300,11 +444,16 @@ class _Writer:
     def _health_payload(self, state: str, stopped_at: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "schema": HEALTH_SCHEMA,
+            "profile_scope_id": self.scope.profile_scope_id,
             "state": state,
             "plugin_version": PLUGIN_VERSION,
             "writer_healthy": self.writer_healthy,
             "started_at": self.started_at,
             "updated_at": _now(),
+            "pre_tool_observation": self.scope.pre_tool_observation,
+            "tool_argument_comparison": self.scope.tool_argument_comparison,
+            "lifecycle_observation": self.scope.lifecycle_observation,
+            "upstream_suppression_count_available": False,
         }
         if self.hermes_version:
             payload["hermes_version"] = self.hermes_version
@@ -356,10 +505,17 @@ class _Writer:
                 pass
 
     def emit(self, event: dict[str, Any]) -> None:
-        with self.lock:
+        event["profile_scope_id"] = self.scope.profile_scope_id
+        event["fingerprint_scope"] = self.scope.fingerprint_scope
+        if self.closed or not self.lock.acquire(blocking=False):
+            self.dropped += 1
+            return
+        try:
             if self.dropped:
-                status = _base_event("ledger-status", "dropped-events")
+                status = _base_event("ledger-status", "dropped-events", _observer_scope=self.scope)
                 status["dropped_event_count"] = self.dropped
+                status["profile_scope_id"] = self.scope.profile_scope_id
+                status["fingerprint_scope"] = self.scope.fingerprint_scope
                 try:
                     self.queue.put_nowait(status)
                     self.dropped = 0
@@ -370,6 +526,8 @@ class _Writer:
                 self.queue.put_nowait(event)
             except queue.Full:
                 self.dropped += 1
+        finally:
+            self.lock.release()
 
     def _run(self) -> None:
         try:
@@ -400,8 +558,10 @@ class _Writer:
             pass
         with self.lock:
             if self.dropped:
-                status = _base_event("ledger-status", "dropped-events")
+                status = _base_event("ledger-status", "dropped-events", _observer_scope=self.scope)
                 status["dropped_event_count"] = self.dropped
+                status["profile_scope_id"] = self.scope.profile_scope_id
+                status["fingerprint_scope"] = self.scope.fingerprint_scope
                 try:
                     self.queue.put_nowait(status)
                     self.dropped = 0
@@ -424,24 +584,47 @@ _WRITER_LOCK = threading.Lock()
 
 def _writer() -> _Writer:
     global _WRITER
+    scope = _scope()
+    if scope.closed:
+        raise _MeasurementUnavailable()
+    if scope.writer is not None:
+        return scope.writer
+    # Registered callbacks always receive an eagerly prepared scope. This lazy
+    # branch is only for direct legacy embedding, never callback disk work.
+    if _CURRENT_SCOPE.get() is not None:
+        raise _MeasurementUnavailable()
     with _WRITER_LOCK:
-        if _WRITER is None:
-            _WRITER = _Writer()
-        return _WRITER
+        if scope.writer is None:
+            scope.writer = _Writer(scope)
+        _WRITER = scope.writer
+        return scope.writer
 
 
 def _shutdown() -> None:
-    global _WRITER
+    global _WRITER, _DEFAULT_SCOPE
     with _WRITER_LOCK:
-        writer, _WRITER = _WRITER, None
-    if writer is not None:
-        writer.close()
+        _WRITER, _DEFAULT_SCOPE = None, None
+        scopes = list(_SCOPES)
+        _SCOPES.clear()
+    for scope in scopes:
+        _close_scope(scope)
+
+
+def _close_scope(scope: _Scope) -> None:
+    scope.closed = True
+    if scope.writer is not None:
+        scope.writer.close()
+    scope.terminal_outputs.clear()
+    scope.pending_delegations.clear()
+    if scope in _SCOPES:
+        _SCOPES.remove(scope)
 
 
 atexit.register(_shutdown)
 
 
 def _base_event(event_type: str, phase: str, **kwargs: Any) -> dict[str, Any]:
+    scope = kwargs.get("_observer_scope") or _scope()
     event: dict[str, Any] = {
         "schema": SCHEMA,
         "telemetry_schema_version": kwargs.get(
@@ -451,7 +634,13 @@ def _base_event(event_type: str, phase: str, **kwargs: Any) -> dict[str, Any]:
         "timestamp": _now(),
         "event_type": event_type,
         "phase": phase,
-        "fingerprint_scope": _FINGERPRINT_SCOPE,
+        "fingerprint_scope": scope.fingerprint_scope,
+        "profile_scope_id": scope.profile_scope_id,
+        "pre_tool_observation": scope.pre_tool_observation,
+        "tool_argument_comparison": scope.tool_argument_comparison,
+        "hermes_version": scope.hermes_version,
+        "lifecycle_observation": scope.lifecycle_observation,
+        "upstream_suppression_count_available": False,
     }
     mapping = {
         "session_id": "session_id",
@@ -461,11 +650,29 @@ def _base_event(event_type: str, phase: str, **kwargs: Any) -> dict[str, Any]:
         "provider": "provider",
         "model": "model",
         "status": "status",
+        "task": "task",
+        "task_id": "task_id",
+        "parent_turn_id": "parent_turn_id",
+        "subagent_id": "subagent_id",
+        "parent_subagent_id": "parent_subagent_id",
+        "child_subagent_id": "child_subagent_id",
     }
     for source, target in mapping.items():
         value = _text(kwargs.get(source))
         if value:
             event[target] = value
+    for key in ("retry_count", "status_code", "api_call_count"):
+        value = _nonnegative_int(kwargs.get(key))
+        if value is not None:
+            event[key] = value
+    if phase in {"api-request-start", "api-request-end", "api-request-error"}:
+        # Native logical-call clocks are distinct from this writer's timestamp.
+        # Preserve only delivered finite numeric seconds; missing or invalid
+        # values must not become proof for joining multiple observed attempts.
+        for key in ("started_at", "ended_at"):
+            value = _number(kwargs.get(key))
+            if value is not None and 0 < value <= 8640000000000:
+                event[key] = value
     return event
 
 
@@ -478,8 +685,13 @@ def on_session_start(**kwargs: Any) -> None:
     session_id = _text(kwargs.get("session_id"))
     if not session_id:
         return
-    with _PENDING_DELEGATIONS_LOCK:
-        pending = _PENDING_DELEGATIONS.pop(session_id, None)
+    scope = _scope()
+    if not scope.delegation_lock.acquire(blocking=False):
+        raise _MeasurementUnavailable()
+    try:
+        pending = scope.pending_delegations.pop(session_id, None)
+    finally:
+        scope.delegation_lock.release()
     if pending is None:
         return
     parent_session_id, queued_at = pending
@@ -596,18 +808,58 @@ def on_post_tool_call(**kwargs: Any) -> None:
     event = _base_event("tool", "post", **kwargs)
     event["tool_name"] = tool_name
     event["returned_bytes"] = len(_json_bytes(kwargs.get("result")))
+    if "args" in kwargs and kwargs.get("status") not in {"blocked", "cancelled", "canceled"}:
+        event["executed_input_bytes"] = len(_json_bytes(kwargs["args"]))
+        event["executed_input_fingerprint"] = _fingerprint(kwargs["args"])
+        target = _target(kwargs["args"])
+        if tool_name in _WRITE_TOOLS and target is not None:
+            event["executed_target_fingerprint"] = _fingerprint(target)
     duration = _number(kwargs.get("duration_ms"))
     if duration is not None:
         event["duration_ms"] = duration
     _writer().emit(event)
 
+    if tool_name == "delegate_task":
+        result = kwargs.get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (ValueError, RecursionError):
+                return
+        _bounded_json(result)
+        results = result.get("results") if isinstance(result, dict) else None
+        if isinstance(results, list):
+            if len(results) > 10:
+                raise _MeasurementUnavailable()
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                # Batch results do not identify a child session. Retain only
+                # native categorical validation evidence, never result content.
+                child_result = _base_event("delegation", "subagent-result", **kwargs)
+                child_result.pop("status", None)
+                status = item.get("status")
+                if isinstance(status, str) and status in {"completed", "partial", "error", "failed", "cancelled", "canceled", "timeout", "running", "success", "interrupted"}:
+                    child_result["status"] = status
+                if isinstance(item.get("schema_valid"), bool):
+                    child_result["schema_valid"] = item["schema_valid"]
+                task_index = _nonnegative_int(item.get("task_index"))
+                if task_index is not None:
+                    child_result["task_index"] = task_index
+                _writer().emit(child_result)
+
     if tool_name == "terminal":
         key = _terminal_context_key(kwargs)
-        with _TERMINAL_OUTPUTS_LOCK:
-            pending = _TERMINAL_OUTPUTS.get(key, [])
+        scope = _scope()
+        if not scope.terminal_lock.acquire(blocking=False):
+            raise _MeasurementUnavailable()
+        try:
+            pending = scope.terminal_outputs.get(key, [])
             captured = pending.pop(0) if pending else None
             if not pending:
-                _TERMINAL_OUTPUTS.pop(key, None)
+                scope.terminal_outputs.pop(key, None)
+        finally:
+            scope.terminal_lock.release()
         output = _terminal_output_text(kwargs.get("result"))
         returned_bytes = _terminal_output_bytes(kwargs.get("result"))
         output_total_chars = _terminal_output_total_chars(kwargs.get("result"))
@@ -662,7 +914,10 @@ def on_post_tool_call(**kwargs: Any) -> None:
 
 
 def transform_terminal_output(**kwargs: Any) -> None:
-    output = _text(kwargs.get("output"))
+    output = kwargs.get("output", "")
+    if not isinstance(output, str):
+        raise _MeasurementUnavailable()
+    _bounded_json(output)
     generated_bytes = len(output.encode("utf-8", errors="replace"))
     match = _TRUNCATION_RE.search(output)
     truncated_bytes = 0
@@ -676,9 +931,18 @@ def transform_terminal_output(**kwargs: Any) -> None:
         truncated_bytes = max(omitted_chars, total_chars - len(output), 0)
         basis = "lower-bound"
     key = _terminal_context_key(kwargs)
-    with _TERMINAL_OUTPUTS_LOCK:
-        pending = _TERMINAL_OUTPUTS.setdefault(key, [])
+    scope = _scope()
+    if not scope.terminal_lock.acquire(blocking=False):
+        raise _MeasurementUnavailable()
+    try:
+        if key not in scope.terminal_outputs and len(scope.terminal_outputs) >= MAX_QUEUE_SIZE:
+            raise _MeasurementUnavailable()
+        pending = scope.terminal_outputs.setdefault(key, [])
+        if len(pending) >= 64:
+            raise _MeasurementUnavailable()
         pending.append((generated_bytes, truncated_bytes, basis))
+    finally:
+        scope.terminal_lock.release()
     return None
 
 
@@ -691,8 +955,18 @@ def on_subagent_start(**kwargs: Any) -> None:
         event["parent_session_id"] = parent
     if child:
         event["child_session_id"] = child
-        with _PENDING_DELEGATIONS_LOCK:
-            _PENDING_DELEGATIONS[child] = (parent, time.monotonic())
+        scope = _scope()
+        if not scope.delegation_lock.acquire(blocking=False):
+            raise _MeasurementUnavailable()
+        try:
+            if child not in scope.pending_delegations and len(scope.pending_delegations) >= MAX_QUEUE_SIZE:
+                raise _MeasurementUnavailable()
+            # Duplicate spawn identities are ambiguous, not a newer queue start.
+            scope.pending_delegations[child] = (
+                None if child in scope.pending_delegations else (parent, time.monotonic())
+            )
+        finally:
+            scope.delegation_lock.release()
     wait = _number(kwargs.get("queue_wait_ms"))
     if wait is not None:
         event["queue_wait_ms"] = wait
@@ -711,8 +985,13 @@ def on_subagent_stop(**kwargs: Any) -> None:
         event["parent_session_id"] = parent
     if child:
         event["child_session_id"] = child
-        with _PENDING_DELEGATIONS_LOCK:
-            _PENDING_DELEGATIONS.pop(child, None)
+        scope = _scope()
+        if not scope.delegation_lock.acquire(blocking=False):
+            raise _MeasurementUnavailable()
+        try:
+            scope.pending_delegations.pop(child, None)
+        finally:
+            scope.delegation_lock.release()
     duration = _number(kwargs.get("duration_ms"))
     if duration is not None:
         event["duration_ms"] = duration
@@ -720,17 +999,51 @@ def on_subagent_stop(**kwargs: Any) -> None:
 
 
 def register(ctx: Any) -> None:
-    ctx.register_hook("pre_api_request", on_pre_api_request)
-    ctx.register_hook("post_api_request", on_post_api_request)
-    ctx.register_hook("api_request_error", on_api_request_error)
-    ctx.register_hook("pre_tool_call", on_pre_tool_call)
-    ctx.register_hook("post_tool_call", on_post_tool_call)
-    ctx.register_hook("transform_terminal_output", transform_terminal_output)
-    ctx.register_hook("subagent_start", on_subagent_start)
-    ctx.register_hook("subagent_stop", on_subagent_stop)
-    ctx.register_hook("on_session_start", on_session_start)
-    ctx.register_hook("on_session_end", on_session_end)
-    ctx.register_hook("on_session_finalize", on_session_finalize)
-    # Registration proves the gateway loaded the plugin. Create the writer and
-    # process health sidecar before the first workload event arrives.
-    _writer()
+    global _WRITER
+    # Hermes pre-tool hooks fail closed on exceptions. All callbacks must be
+    # neutral even when instrumentation is unavailable or malformed.
+    try:
+        scope = _Scope(_hermes_home())
+        _SCOPES.append(scope)
+        token = _CURRENT_SCOPE.set(scope)
+        try:
+            scope.writer = _Writer(scope)
+            _WRITER = scope.writer  # legacy direct-embedding diagnostic handle
+        finally:
+            _CURRENT_SCOPE.reset(token)
+    except Exception:
+        return None
+
+    def bind(callback):
+        def observe(**kwargs: Any) -> None:
+            if scope.closed:
+                return None
+            token = _CURRENT_SCOPE.set(scope)
+            try:
+                callback(**kwargs)
+            except Exception:
+                if scope.writer is not None:
+                    scope.writer.dropped += 1
+            finally:
+                _CURRENT_SCOPE.reset(token)
+            return None
+        return observe
+
+    for name, callback in (
+        ("pre_api_request", on_pre_api_request),
+        ("post_api_request", on_post_api_request),
+        ("api_request_error", on_api_request_error),
+        ("pre_tool_call", on_pre_tool_call),
+        ("post_tool_call", on_post_tool_call),
+        ("transform_terminal_output", transform_terminal_output),
+        ("subagent_start", on_subagent_start),
+        ("subagent_stop", on_subagent_stop),
+        ("on_session_start", on_session_start),
+        ("on_session_end", on_session_end),
+        ("on_session_finalize", on_session_finalize),
+    ):
+        if name == "pre_tool_call" and scope.pre_tool_observation != "registered":
+            continue
+        ctx.register_hook(name, bind(callback))
+    if callable(getattr(ctx, "on_unload", None)):
+        ctx.on_unload(lambda: _close_scope(scope))
