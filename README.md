@@ -1,7 +1,7 @@
 # Xerg Hermes observer
 
 This optional plugin writes content-free, local mechanical telemetry to the
-selected Hermes home's `xerg/events/`. The 0.33.0 compatibility update passed
+selected Hermes home's `xerg/events/`. The 0.34.1 compatibility update passed
 bounded live request-detail, accounting-reconciliation, privacy, and baseline
 selection acceptance on these exact Hermes pins:
 
@@ -13,7 +13,7 @@ This acceptance covers the exercised workloads and the limitations below, not
 complete delivery in every concurrent workload. The separately pinned third-party
 OTLP integration has its own acceptance and is not required by this observer.
 The install command selects the currently published observer artifact. Verify its
-version before relying on the 0.33.0 capabilities:
+version before relying on the 0.34.1 capabilities:
 
 ```sh
 hermes plugins install xergai/hermes-observer --enable
@@ -41,7 +41,7 @@ writer-drop count; no upstream suppression count is inferred, including zero.
 Missing API starts prevent exact reconciliation; authoritative economics remain
 aggregate. State-only accounting remains available.
 
-The 0.33.0 observer additively retains delivered numeric native
+The 0.34.1 observer additively retains delivered numeric native
 `started_at` and `ended_at` on API records in the same v1 ledger; missing/invalid
 values stay absent. These are not the observer writer's timestamp. Equivalent
 captured starts in one scoped logical request can reconcile to one completion
@@ -122,7 +122,7 @@ unavailable rather than being guessed. The observer never reads, stats, resolves
 
 Xerg 0.24.0 was not certified for Hermes v0.20.x terminal mechanics and could understate generated
 or truncated byte metrics. Use matching Xerg CLI and observer releases for the
-0.33.0 compatibility behavior; confirm the published versions before upgrading.
+0.34.1 compatibility behavior; confirm the published versions before upgrading.
 The live observer preflight is available from 0.24.2. An older
 Xerg accepts the v1 ledger and ignores the new optional lower-bound fields; a new Xerg accepts old
 ledgers but omits generated/truncated findings when the measurement basis cannot be proven.
