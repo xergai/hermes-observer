@@ -321,7 +321,7 @@ class ObserverPrivacyTest(unittest.TestCase):
             observer_status = next(
                 event for event in events if event["event_type"] == "observer-status"
             )
-            self.assertEqual(observer_status["plugin_version"], "0.35.1")
+            self.assertEqual(observer_status["plugin_version"], "0.35.2")
             self.assertEqual(
                 observer_status["telemetry_schema_version"],
                 "xerg.hermes.observer.v1",
