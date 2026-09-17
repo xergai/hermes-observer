@@ -1,6 +1,6 @@
 # Xerg Hermes observer
 
-Artifact version 0.35.3 preserves the observer behavior and compatibility evidence below.
+Artifact version 0.35.4 preserves the observer behavior and compatibility evidence below.
 
 This optional plugin writes content-free, local mechanical telemetry to the
 selected Hermes home's `xerg/events/`. The 0.34.1 compatibility update passed
